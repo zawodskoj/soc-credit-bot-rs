@@ -1,17 +1,17 @@
 [package]
 name = "soc-credit-bot-rs"
 version = "0.1.0"
-edition = "2018"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+edition = "2024"
 
 [dependencies]
-# grammers-client = "0.4.0"
-grammers-client = { git = "https://github.com/zawodskoj/grammers" }
-grammers-session = { git = "https://github.com/zawodskoj/grammers" }
-grammers-tl-types = { git = "https://github.com/zawodskoj/grammers" }
-futures-util = "0.3.21"
-tokio = { version = "1.20.1", features = ["signal"] }
-simple_logger = "2.2.0"
-log = "0.4.17"
-skia-safe = { git = "https://github.com/rust-skia/rust-skia", features = ["webp"] }
+anyhow = "1.0"
+grammers-client = { git = "https://codeberg.org/Lonami/grammers", rev = "1d46353a97" }
+grammers-session = { git = "https://codeberg.org/Lonami/grammers", rev = "1d46353a97" }
+grammers-tl-types = { git = "https://codeberg.org/Lonami/grammers", rev = "1d46353a97" }
+tokio = { version = "1.52.3", features = ["signal"] }
+tokio-util = { version = "0.7.17", features = ["rt"] }
+skia-safe = { version = "0.97.2", features = ["webp"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.23", features = ["time", "local-time", "env-filter"] }
+time = "0.3"
+dotenvy = "0.15"

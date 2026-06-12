@@ -1,26 +1,20 @@
-use std::convert::TryInto;
-use futures_util::future::{select, Either};
-use grammers_client::{Client, Config, InitParams, InputMessage, Update};
-use grammers_session::Session;
-use log;
-use simple_logger::SimpleLogger;
-use std::env;
 use std::fs::read;
-use std::pin::pin;
-use grammers_client::client::bots::InlineResult;
-use grammers_client::types::inline_query;
-use grammers_client::types::inline_query::Article;
-use grammers_tl_types::{enums, Serializable, types};
-use grammers_tl_types::enums::{Document, InputBotInlineMessage, InputDocument, InputMedia, InputPeer, MessageMedia};
+use std::sync::Arc;
+use anyhow::Context;
+use grammers_client::{Client, SenderPool};
+use grammers_client::update::Update;
+use grammers_session::storages::SqliteSession;
+use grammers_tl_types::enums::{Document, DocumentAttribute, InputBotInlineResult, InputDocument, InputPeer, InputStickerSet, MessageMedia};
 use grammers_tl_types::functions::messages::UploadMedia;
-use grammers_tl_types::types::{InputBotInlineMessageMediaAuto, InputBotInlineMessageText, InputBotInlineResult, InputBotInlineResultDocument, InputMediaUploadedDocument, InputMediaUploadedPhoto, InputStickeredMediaDocument, MessageMediaDocument};
-use skia_safe::{Canvas, Color4f, ColorSpace, Data, EncodedImageFormat, Font, Image, Paint, Point, Size, Surface, TextBlob, TextEncoding, Typeface};
+use grammers_tl_types::types::{DocumentAttributeImageSize, DocumentAttributeSticker, InputBotInlineMessageMediaAuto, InputBotInlineResultDocument, InputMediaUploadedDocument, MessageMediaDocument};
+use skia_safe::{surfaces, Canvas, Color4f, ColorSpace, Data, EncodedImageFormat, Font, FontMgr, Image, Paint, TextBlob};
+use time::format_description::well_known::Iso8601;
 use tokio::{runtime, task};
-use tokio::io::AsyncRead;
-
-type Result = std::result::Result<(), Box<dyn std::error::Error>>;
-
-const SESSION_FILE: &str = "echo.session";
+use tokio_util::task::AbortOnDropHandle;
+use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::fmt::time::LocalTime;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 const DIGITS: &str = "一二三四五六七八九";
 const EXPONENTS: &str = "十百千";
@@ -113,15 +107,17 @@ fn format_chinese_number(number: i32) -> Option<String> {
 }
 
 fn render(base: Image, latin_number: String, chinese_number: String) -> Option<Vec<u8>> {
-    let mut surface = Surface::new_raster_n32_premul((512, 174))?;
-    let mut canvas = surface.canvas();
+    let mut surface = surfaces::raster_n32_premul((512, 174))?;
+    let canvas = surface.canvas();
+
+    let font_mgr = FontMgr::new();
 
     let srgb = ColorSpace::new_srgb();
     let white_paint = Paint::new(Color4f::new(1.0, 1.0, 1.0, 1.0), &srgb);
     let black_paint = Paint::new(Color4f::new(0.0, 0.0, 0.0, 1.0), &srgb);
 
-    let mut render_shadowed = |canvas: &mut Canvas, text: String, font: &Font, x: i32, y: i32| -> Option<()> {
-        let tl = TextBlob::from_text(&text.to_bytes(), TextEncoding::UTF8, &font)?;
+    let render_shadowed = |canvas: &Canvas, text: String, font: &Font, x: i32, y: i32| -> Option<()> {
+        let tl = TextBlob::from_text(&text, &font)?;
 
         canvas.draw_text_blob(&tl, (x + 4, y + 4), &black_paint);
         canvas.draw_text_blob(&tl, (x, y), &white_paint);
@@ -131,65 +127,65 @@ fn render(base: Image, latin_number: String, chinese_number: String) -> Option<V
 
     canvas.draw_image(base, (0, 0), None);
 
-    let cjkTypefaceData = read("3rdparty/BIZ-UDGothicR.ttc").ok()?;
-    let cjkTypeface = Typeface::from_data(Data::new_copy(&cjkTypefaceData), None)?;
-    let cjkFontLarge = Font::new(&cjkTypeface, Some(40.0.into()));
-    let cjkFontMedium = Font::new(&cjkTypeface, Some(36.0.into()));
-    let cjkFontSmall = Font::new(&cjkTypeface, Some(32.0.into()));
-    let cjkFontPico = Font::new(&cjkTypeface, Some(28.0.into()));
+    let cjk_typeface_data = read("3rdparty/BIZ-UDGothicR.ttc").ok()?;
+    let cjk_typeface = font_mgr.new_from_data(&cjk_typeface_data, None).expect("where font");
+    let cjk_font_large = Font::new(&cjk_typeface, Some(40.0.into()));
+    let cjk_font_medium = Font::new(&cjk_typeface, Some(36.0.into()));
+    let cjk_font_small = Font::new(&cjk_typeface, Some(32.0.into()));
+    let cjk_font_pico = Font::new(&cjk_typeface, Some(28.0.into()));
 
-    let latinYComp = match chinese_number.chars().count() {
+    let latin_y_comp = match chinese_number.chars().count() {
         _4 if _4 <= 4 => {
-            render_shadowed(canvas, chinese_number + CHINESE_SUFFIX, &cjkFontLarge, 160, 140);
+            render_shadowed(canvas, chinese_number + CHINESE_SUFFIX, &cjk_font_large, 160, 140);
             0
         }
         5 => {
-            render_shadowed(canvas, chinese_number + CHINESE_SUFFIX, &cjkFontMedium, 160, 140);
+            render_shadowed(canvas, chinese_number + CHINESE_SUFFIX, &cjk_font_medium, 160, 140);
             0
         }
         6 => {
-            render_shadowed(canvas, chinese_number + CHINESE_SUFFIX, &cjkFontSmall, 160, 140);
+            render_shadowed(canvas, chinese_number + CHINESE_SUFFIX, &cjk_font_small, 160, 140);
             0
         }
         7 => {
-            render_shadowed(canvas, chinese_number + CHINESE_SUFFIX, &cjkFontPico, 160, 135);
+            render_shadowed(canvas, chinese_number + CHINESE_SUFFIX, &cjk_font_pico, 160, 135);
             10
         }
         8 | 9 | 10 | 11 => {
-            render_shadowed(canvas, chinese_number, &cjkFontPico, 160, 110);
-            render_shadowed(canvas, CHINESE_SUFFIX.into(), &cjkFontPico, 160, 145);
+            render_shadowed(canvas, chinese_number, &cjk_font_pico, 160, 110);
+            render_shadowed(canvas, CHINESE_SUFFIX.into(), &cjk_font_pico, 160, 145);
             0
         }
         _ => {
-            let mut splitPosition = (chinese_number.chars().count() + CHINESE_SUFFIX.chars().count()) / 2;
-            let firstWrappedChar = chinese_number.chars().nth(splitPosition)?;
+            let mut split_position = (chinese_number.chars().count() + CHINESE_SUFFIX.chars().count()) / 2;
+            let first_wrapped_char = chinese_number.chars().nth(split_position)?;
 
-            if !DIGITS.contains(firstWrappedChar) && firstWrappedChar != ZERO_MARK && firstWrappedChar != TWO_MARK_FOR_THOUSANDS {
-                splitPosition += 1; // try not to break periods
+            if !DIGITS.contains(first_wrapped_char) && first_wrapped_char != ZERO_MARK && first_wrapped_char != TWO_MARK_FOR_THOUSANDS {
+                split_position += 1; // try not to break periods
             }
 
-            let (lp, rp) = chinese_number.split_at(splitPosition);
-            render_shadowed(canvas, lp.into(), &cjkFontPico, 160, 110);
-            render_shadowed(canvas, rp.to_string() + CHINESE_SUFFIX, &cjkFontPico, 160, 145);
+            let (lp, rp) = chinese_number.split_at(split_position);
+            render_shadowed(canvas, lp.into(), &cjk_font_pico, 160, 110);
+            render_shadowed(canvas, rp.to_string() + CHINESE_SUFFIX, &cjk_font_pico, 160, 145);
             0
         }
     };
 
-    let latinTypefaceData = read("3rdparty/VCR_OSD_MONO_1.001.ttf").ok()?;
-    let latinTypeface = Typeface::from_data(Data::new_copy(&latinTypefaceData), None)?;
-    let latinFontLarge = Font::new(&latinTypeface, Some(29.0.into()));
-    let latinFontSmall = Font::new(&latinTypeface, Some(24.0.into()));
+    let latin_typeface_data = read("3rdparty/VCR_OSD_MONO_1.001.ttf").ok()?;
+    let latin_typeface = font_mgr.new_from_data(&latin_typeface_data, None).expect("where font");
+    let latin_font_large = Font::new(&latin_typeface, Some(29.0.into()));
+    let latin_font_small = Font::new(&latin_typeface, Some(24.0.into()));
 
     // render latin number
-    let latinSuffix = if latin_number.chars().count() > 7 { LATIN_SUFFIX_SHORT } else { LATIN_SUFFIX_FULL };
-    let (latinFont, latinY) = if latin_number.chars().count() > 4 { (latinFontSmall, 75) } else { (latinFontLarge, 80) };
+    let latin_suffix = if latin_number.chars().count() > 7 { LATIN_SUFFIX_SHORT } else { LATIN_SUFFIX_FULL };
+    let (latin_font, latin_y) = if latin_number.chars().count() > 4 { (latin_font_small, 75) } else { (latin_font_large, 80) };
 
-    render_shadowed(canvas, latin_number + " " + latinSuffix, &latinFont, 160, latinY + latinYComp);
+    render_shadowed(canvas, latin_number + " " + latin_suffix, &latin_font, 160, latin_y + latin_y_comp);
 
     let image = surface.image_snapshot();
-    let data = image.encode_to_data(EncodedImageFormat::WEBP)?;
 
-    Some(data.as_bytes().to_bytes())
+    let data = image.encode(None, EncodedImageFormat::WEBP, Some(90))?;
+    Some(data.as_bytes().to_vec())
 }
 
 fn render_number(orig_number: i32, sig: &str, base: Image) -> Option<Vec<u8>> {
@@ -213,78 +209,81 @@ fn render_raw_number(amount: i32) -> Option<Vec<u8>> {
     }
 }
 
-async fn handle_update(client: Client, update: Update) -> Result {
+async fn handle_update(client: Client, update: Update) -> anyhow::Result<()> {
     match update {
         Update::NewMessage(message) if !message.outgoing() => {
-            let chat = message.chat();
-            println!("Responding to {}", chat.name());
-            client.send_message(&chat, message.text()).await?;
+            let Some(chat) = message.peer() else {
+                return Ok(())
+            };
+
+            println!("Responding to {}", chat.name().unwrap());
+            // todo: excess unwraps do something about please omg
+            client.send_message(message.peer_ref().await.unwrap().unwrap(), message.text()).await?;
         }
         Update::InlineQuery(query) => {
             println!("Query {}", query.text());
 
-            // let doc = InputDocument::Document(InputStickeredMediaDocument { })
-
             let number: i32 = query.text().parse()?;
-            let picture = render_raw_number(number).ok_or("idk")?;
+            let picture = render_raw_number(number).context("Failed to render font")?;
             let mut cursor = std::io::Cursor::new(&picture);
 
             let file = client.upload_stream(&mut cursor, picture.len(), "sticker.webp".into()).await?;
             let uploaded = client.invoke(&UploadMedia {
+                business_connection_id: None,
                 media: InputMediaUploadedDocument {
                     nosound_video: false,
-                    file: file.input_file,
+                    file: file.raw,
                     thumb: None,
                     ttl_seconds: None,
                     mime_type: "image/webp".into(),
-                    attributes: vec!(),
+                    attributes: vec![
+                        DocumentAttribute::ImageSize(DocumentAttributeImageSize {
+                            w: 512,
+                            h: 174,
+                        }),
+                        DocumentAttribute::Sticker(DocumentAttributeSticker {
+                            mask: false,
+                            alt: "😀".into(),
+                            stickerset: InputStickerSet::Empty,
+                            mask_coords: None,
+                        }),
+                    ],
                     spoiler: false,
                     force_file: false,
                     stickers: None,
+                    video_cover: None,
+                    video_timestamp: None,
                 }.into(),
                 peer: InputPeer::PeerSelf
             }).await?;
 
             if let MessageMedia::Document(MessageMediaDocument { document: Some(Document::Document(d)), .. }) = uploaded {
-                let x = types::InputDocument {
+                let x = grammers_tl_types::types::InputDocument {
                     id: d.id,
                     access_hash: d.access_hash,
                     file_reference: d.file_reference
                 };
 
-                query.answer(vec!(inline_query::InlineResult(enums::InputBotInlineResult::Document(InputBotInlineResultDocument {
-                    document: InputDocument::Document(x),
-                    title: Some("title".into()),
-                    id: "1".into(),
-                    r#type: "sticker".into(),
-                    description: Some("asd".into()),
-                    send_message: InputBotInlineMessageMediaAuto {
-                        message: "".into(),
-                        entities: None,
-                        reply_markup: None
-                    }.into() })))).send().await?;
+                query.answer(
+                    vec![
+                        InputBotInlineResult::Document(
+                            InputBotInlineResultDocument {
+                                document: InputDocument::Document(x),
+                                title: Some("title".into()),
+                                id: "1".into(),
+                                r#type: "sticker".into(),
+                                description: Some("asd".into()),
+                                send_message: InputBotInlineMessageMediaAuto {
+                                    invert_media: false,
+                                    message: "wtf".into(),
+                                    entities: None,
+                                    reply_markup: None
+                                }.into()
+                            }
+                        )
+                    ]
+                ).send().await?;
             }
-
-            // query.answer(vec!(inline_query::InlineResult(enums::InputBotInlineResult::Result(InputBotInlineResultDocument {
-            //     title: Some("title".into()),
-            //     id: "1".into(),
-            //     r#type: "article".into(),
-            //     description: Some("asd".into()),
-            //     thumb: None,
-            //     url: None,
-            //     content: None,
-            //     send_message: InputBotInlineMessageMediaAuto {
-            //         message: "kek".into(),
-            //         entities: None,
-            //         no_webpage: true,
-            //         reply_markup: None
-            //     }.into() })))).send().await?;
-            //     // send_message: InputBotInlineMessageText {
-            //     //     message: "kek".into(),
-            //     //     entities: None,
-            //     //     no_webpage: true,
-            //     //     reply_markup: None
-            //     // }.into() })))).send().await?;
         }
         _ => {}
     }
@@ -292,80 +291,81 @@ async fn handle_update(client: Client, update: Update) -> Result {
     Ok(())
 }
 
-async fn async_main() -> Result {
-    SimpleLogger::new()
-        .with_level(log::LevelFilter::Debug)
-        .init()
-        .unwrap();
+async fn async_main() -> anyhow::Result<()> {
+    tracing_subscriber::registry()
+        .with(
+            fmt::layer()
+                .with_timer(LocalTime::new(Iso8601::DATE_TIME))
+                .with_ansi(true)
+        )
+        .with(
+            EnvFilter::builder()
+                .with_default_directive(tracing::Level::DEBUG.into())
+                .with_env_var("SOC_LOG")
+                .from_env_lossy()
+        )
+        .init();
 
-    let api_id = env!("TG_ID").parse().expect("TG_ID invalid");
-    let api_hash = env!("TG_HASH").to_string();
-    let token = env::args().skip(1).next().expect("token missing");
+    dotenvy::dotenv()?;
+
+    let api_id = dotenvy::var("API_ID").expect("please provide API_ID").parse().expect("API_ID should be an integer");
+    let api_hash = dotenvy::var("API_HASH").expect("please provide API_HASH");
+
+    let token = dotenvy::var("BOT_TOKEN").expect("please provide BOT_TOKEN");
 
     println!("Connecting to Telegram...");
-    let client = Client::connect(Config {
-        session: Session::load_file_or_create(SESSION_FILE)?,
-        api_id,
-        api_hash: api_hash.clone(),
-        params: InitParams {
-            // Fetch the updates we missed while we were offline
-            catch_up: true,
-            ..Default::default()
-        },
-    })
-        .await?;
-    println!("Connected!");
+
+    let session = Arc::new(SqliteSession::open("bot777.session").await?);
+    let pool = SenderPool::new(Arc::clone(&session), api_id);
+
+    let client = Client::new(pool.handle);
+
+    let _pool = AbortOnDropHandle::new(tokio::spawn(pool.runner.run()));
 
     if !client.is_authorized().await? {
         println!("Signing in...");
-        client.bot_sign_in(&token, api_id, &api_hash).await?;
-        client.session().save_to_file(SESSION_FILE)?;
+        client.bot_sign_in(&token, &api_hash).await?;
         println!("Signed in!");
     }
 
     println!("Waiting for messages...");
 
-    // This code uses `select` on Ctrl+C to gracefully stop the client and have a chance to
-    // save the session. You could have fancier logic to save the session if you wanted to
-    // (or even save it on every update). Or you could also ignore Ctrl+C and just use
-    // `while let Some(updates) =  client.next_updates().await?`.
-    //
-    // Using `tokio::select!` would be a lot cleaner but add a heavy dependency,
-    // so a manual `select` is used instead by pinning async blocks by hand.
+    let mut updates = client.stream_updates(pool.updates, Default::default()).await.unwrap();
+
     loop {
-        let update = {
-            let exit = pin!(async { tokio::signal::ctrl_c().await });
-            let upd = pin!(async { client.next_update().await });
-
-            match select(exit, upd).await {
-                Either::Left(_) => None,
-                Either::Right((u, _)) => Some(u),
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("Received Ctrl-C!");
+                break;
             }
-        };
 
-        let update = match update {
-            None | Some(Ok(None)) => break,
-            Some(u) => u?.unwrap(),
-        };
+            upd = updates.next() => {
+                match upd {
+                    Ok(upd) => {
+                        let client = client.clone();
+                        task::spawn(async move {
+                            let r = handle_update(client, upd).await;
 
-        let handle = client.clone();
-        task::spawn(async move {
-            match handle_update(handle, update).await {
-                Ok(_) => {}
-                Err(e) => eprintln!("Error handling updates!: {}", e),
+                            if let Err(r) = r {
+                                tracing::error!("Failed to handle update: {}", r);
+                            }
+                        });
+                    },
+                    Err(e) => {
+                        eprintln!("Failed to get update: {e}");
+                        break;
+                    }
+                }
             }
-        });
+        }
     }
 
-    println!("Saving session file and exiting...");
-    client.session().save_to_file(SESSION_FILE)?;
     Ok(())
 }
 
-fn main() -> Result {
+fn main() -> anyhow::Result<()> {
     runtime::Builder::new_current_thread()
         .enable_all()
-        .build()
-        .unwrap()
+        .build()?
         .block_on(async_main())
 }
