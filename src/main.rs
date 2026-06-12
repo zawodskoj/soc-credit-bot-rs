@@ -7,7 +7,7 @@ use grammers_session::storages::SqliteSession;
 use grammers_tl_types::enums::{Document, DocumentAttribute, InputBotInlineResult, InputDocument, InputPeer, InputStickerSet, MessageMedia};
 use grammers_tl_types::functions::messages::UploadMedia;
 use grammers_tl_types::types::{DocumentAttributeImageSize, DocumentAttributeSticker, InputBotInlineMessageMediaAuto, InputBotInlineResultDocument, InputMediaUploadedDocument, MessageMediaDocument};
-use skia_safe::{surfaces, Canvas, Color4f, ColorSpace, Data, EncodedImageFormat, Font, FontMgr, Image, Paint, TextBlob};
+use skia_safe::{surfaces, Canvas, Color4f, ColorSpace, Data, EncodedImageFormat, Font, FontMgr, Image, Paint, TextBlob, Typeface};
 use time::format_description::well_known::Iso8601;
 use tokio::{runtime, task};
 use tokio_util::task::AbortOnDropHandle;
@@ -24,6 +24,11 @@ const TWO_MARK_FOR_THOUSANDS: char = '两';
 const CHINESE_SUFFIX: &str = "社会信用";
 const LATIN_SUFFIX_SHORT: &str = "Soc. Credit";
 const LATIN_SUFFIX_FULL: &str = "Social Credit";
+
+struct Typefaces {
+    cjk: Typeface,
+    latin: Typeface
+}
 
 fn format_latin_number(number: i32) -> Option<String>  {
     let abs = number.abs();
@@ -106,11 +111,9 @@ fn format_chinese_number(number: i32) -> Option<String> {
     Some(result)
 }
 
-fn render(base: Image, latin_number: String, chinese_number: String) -> Option<Vec<u8>> {
+fn render(base: Image, latin_number: String, chinese_number: String, typefaces: &Typefaces) -> Option<Vec<u8>> {
     let mut surface = surfaces::raster_n32_premul((512, 174))?;
     let canvas = surface.canvas();
-
-    let font_mgr = FontMgr::new();
 
     let srgb = ColorSpace::new_srgb();
     let white_paint = Paint::new(Color4f::new(1.0, 1.0, 1.0, 1.0), &srgb);
@@ -127,12 +130,10 @@ fn render(base: Image, latin_number: String, chinese_number: String) -> Option<V
 
     canvas.draw_image(base, (0, 0), None);
 
-    let cjk_typeface_data = read("3rdparty/BIZ-UDGothicR.ttc").ok()?;
-    let cjk_typeface = font_mgr.new_from_data(&cjk_typeface_data, None).expect("where font");
-    let cjk_font_large = Font::new(&cjk_typeface, Some(40.0.into()));
-    let cjk_font_medium = Font::new(&cjk_typeface, Some(36.0.into()));
-    let cjk_font_small = Font::new(&cjk_typeface, Some(32.0.into()));
-    let cjk_font_pico = Font::new(&cjk_typeface, Some(28.0.into()));
+    let cjk_font_large = Font::new(&typefaces.cjk, Some(40.0.into()));
+    let cjk_font_medium = Font::new(&typefaces.cjk, Some(36.0.into()));
+    let cjk_font_small = Font::new(&typefaces.cjk, Some(32.0.into()));
+    let cjk_font_pico = Font::new(&typefaces.cjk, Some(28.0.into()));
 
     let latin_y_comp = match chinese_number.chars().count() {
         _4 if _4 <= 4 => {
@@ -171,10 +172,8 @@ fn render(base: Image, latin_number: String, chinese_number: String) -> Option<V
         }
     };
 
-    let latin_typeface_data = read("3rdparty/VCR_OSD_MONO_1.001.ttf").ok()?;
-    let latin_typeface = font_mgr.new_from_data(&latin_typeface_data, None).expect("where font");
-    let latin_font_large = Font::new(&latin_typeface, Some(29.0.into()));
-    let latin_font_small = Font::new(&latin_typeface, Some(24.0.into()));
+    let latin_font_large = Font::new(&typefaces.latin, Some(29.0.into()));
+    let latin_font_small = Font::new(&typefaces.latin, Some(24.0.into()));
 
     // render latin number
     let latin_suffix = if latin_number.chars().count() > 7 { LATIN_SUFFIX_SHORT } else { LATIN_SUFFIX_FULL };
@@ -188,28 +187,28 @@ fn render(base: Image, latin_number: String, chinese_number: String) -> Option<V
     Some(data.as_bytes().to_vec())
 }
 
-fn render_number(orig_number: i32, sig: &str, base: Image) -> Option<Vec<u8>> {
+fn render_number(orig_number: i32, sig: &str, base: Image, typefaces: &Typefaces) -> Option<Vec<u8>> {
     let chinese_number = format_chinese_number(orig_number)?;
     let latin_number = format_latin_number(orig_number)?;
 
-    render(base, sig.to_string() + latin_number.as_str(), sig.to_string() + chinese_number.as_str())
+    render(base, sig.to_string() + latin_number.as_str(), sig.to_string() + chinese_number.as_str(), typefaces)
 }
 
-fn render_raw_number(amount: i32) -> Option<Vec<u8>> {
+fn render_raw_number(amount: i32, typefaces: &Typefaces) -> Option<Vec<u8>> {
     if amount == 0 {
         return None;
     }
 
     if amount < 0 {
         let minus = Image::from_encoded(Data::new_copy(&read("3rdparty/minus.png").ok()?))?;
-        render_number(amount, "-", minus)
+        render_number(amount, "-", minus, typefaces)
     } else {
         let plus = Image::from_encoded(Data::new_copy(&read("3rdparty/plus.png").ok()?))?;
-        render_number(amount, "+", plus)
+        render_number(amount, "+", plus, typefaces)
     }
 }
 
-async fn handle_update(client: Client, update: Update) -> anyhow::Result<()> {
+async fn handle_update(client: Client, update: Update, typefaces: &Typefaces) -> anyhow::Result<()> {
     match update {
         Update::NewMessage(message) if !message.outgoing() => {
             let Some(chat) = message.peer() else {
@@ -224,7 +223,7 @@ async fn handle_update(client: Client, update: Update) -> anyhow::Result<()> {
             println!("Query {}", query.text());
 
             let number: i32 = query.text().parse()?;
-            let picture = render_raw_number(number).context("Failed to render font")?;
+            let picture = render_raw_number(number, typefaces).context("Failed to render font")?;
             let mut cursor = std::io::Cursor::new(&picture);
 
             let file = client.upload_stream(&mut cursor, picture.len(), "sticker.webp".into()).await?;
@@ -308,6 +307,20 @@ async fn async_main() -> anyhow::Result<()> {
 
     dotenvy::dotenv()?;
 
+    let font_mgr = FontMgr::new();
+
+    let cjk_typeface_data = read("3rdparty/BIZ-UDGothicR.ttc")?;
+    let cjk_typeface = font_mgr.new_from_data(&cjk_typeface_data, None).expect("where font");
+
+    let latin_typeface_data = read("3rdparty/VCR_OSD_MONO_1.001.ttf")?;
+    let latin_typeface = font_mgr.new_from_data(&latin_typeface_data, None).expect("where font");
+
+    let typefaces = Typefaces {
+        latin: latin_typeface,
+        cjk: cjk_typeface,
+    };
+    let typefaces = Arc::new(typefaces);
+
     let api_id = dotenvy::var("API_ID").expect("please provide API_ID").parse().expect("API_ID should be an integer");
     let api_hash = dotenvy::var("API_HASH").expect("please provide API_HASH");
 
@@ -343,8 +356,10 @@ async fn async_main() -> anyhow::Result<()> {
                 match upd {
                     Ok(upd) => {
                         let client = client.clone();
+                        let typefaces = typefaces.clone();
+    
                         task::spawn(async move {
-                            let r = handle_update(client, upd).await;
+                            let r = handle_update(client, upd, &typefaces).await;
 
                             if let Err(r) = r {
                                 tracing::error!("Failed to handle update: {}", r);
